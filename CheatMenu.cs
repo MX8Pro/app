@@ -13,6 +13,7 @@ using System.Runtime.InteropServices;
 using System.Threading.Tasks;
 using System.Windows.Forms;
 using System.Globalization;
+using System.ComponentModel;
 
 namespace ShadowCore // تأكد من أن هذا يطابق اسم مشروعك
 {
@@ -95,11 +96,13 @@ namespace ShadowCore // تأكد من أن هذا يطابق اسم مشروعك
         private static extern bool CloseHandle(IntPtr hObject);
 
         // --- Constants & State ---
-        private const uint PROCESS_ALL_ACCESS = 0x1F0FFF;
+        private const uint PROCESS_PERMISSIONS = 0x0010 | 0x0020 | 0x0008 | 0x0400; // VM_READ | VM_WRITE | VM_OPERATION | QUERY_INFORMATION
         private IntPtr processHandle;
         private Process? targetProcess;
         private bool isAttached = false;
         private IntPtr baseAddress;
+        private long moduleSize;
+        private bool timerBusy = false;
 
         // --- UI Elements ---
         private Label lblStatus = null!;
@@ -182,39 +185,66 @@ namespace ShadowCore // تأكد من أن هذا يطابق اسم مشروعك
 
         private void StatusTimer_Tick(object? sender, EventArgs e)
         {
-            var processes = Process.GetProcessesByName("GRW");
-            if (processes.Length > 0)
+            if (timerBusy) return;
+            timerBusy = true;
+            try
             {
-                if (!isAttached)
+                var processes = Process.GetProcessesByName("GRW");
+                if (processes.Length > 0)
                 {
-                    targetProcess = processes[0];
-                    processHandle = OpenProcess(PROCESS_ALL_ACCESS, false, targetProcess.Id);
-                    if (processHandle != IntPtr.Zero && targetProcess.MainModule != null)
+                    if (!isAttached)
                     {
-                        baseAddress = targetProcess.MainModule.BaseAddress;
-                        isAttached = true;
-                        lblStatus.Text = $"الحالة: متصل بـ GRW.exe (PID: {targetProcess.Id})";
-                        lblStatus.ForeColor = Color.LimeGreen;
-                        SetControlsEnabled(true);
+                        try
+                        {
+                            targetProcess = processes[0];
+                            processHandle = OpenProcess(PROCESS_PERMISSIONS, false, targetProcess.Id);
+                            if (processHandle != IntPtr.Zero && targetProcess != null)
+                            {
+                                try
+                                {
+                                    var module = targetProcess.MainModule;
+                                    if (module != null)
+                                    {
+                                        baseAddress = module.BaseAddress;
+                                        moduleSize = module.ModuleMemorySize;
+                                        isAttached = true;
+                                        lblStatus.Text = $"الحالة: متصل بـ GRW.exe (PID: {targetProcess.Id})";
+                                        lblStatus.ForeColor = Color.LimeGreen;
+                                        SetControlsEnabled(true);
+                                    }
+                                }
+                                catch (Win32Exception)
+                                {
+                                    CloseHandle(processHandle);
+                                }
+                            }
+                        }
+                        catch { }
+                    }
+                    if (isAttached)
+                    {
+                        foreach (var cheat in Cheats.OfType<PointerCheat>())
+                        {
+                            ReadPointerValue(cheat);
+                        }
                     }
                 }
-                if (isAttached)
+                else if (isAttached)
                 {
-                    foreach (var cheat in Cheats.OfType<PointerCheat>())
-                    {
-                        ReadPointerValue(cheat);
-                    }
+                    CloseHandle(processHandle);
+                    isAttached = false;
+                    targetProcess = null;
+                    baseAddress = IntPtr.Zero;
+                    moduleSize = 0;
+                    lblStatus.Text = "الحالة: فقدت عملية الهدف. في انتظار GRW.exe...";
+                    lblStatus.ForeColor = Color.Red;
+                    SetControlsEnabled(false);
+                    foreach (var chk in patchCheckBoxes.Values) chk.Checked = false;
                 }
             }
-            else if (isAttached)
+            finally
             {
-                CloseHandle(processHandle);
-                isAttached = false;
-                targetProcess = null;
-                lblStatus.Text = "الحالة: فقدت عملية الهدف. في انتظار GRW.exe...";
-                lblStatus.ForeColor = Color.Red;
-                SetControlsEnabled(false);
-                foreach (var chk in patchCheckBoxes.Values) chk.Checked = false;
+                timerBusy = false;
             }
         }
 
@@ -316,34 +346,49 @@ namespace ShadowCore // تأكد من أن هذا يطابق اسم مشروعك
 
         private IntPtr FindPattern(string pattern)
         {
-            if (targetProcess == null || !isAttached || targetProcess.HasExited || targetProcess.MainModule == null) return IntPtr.Zero;
+            if (!isAttached || baseAddress == IntPtr.Zero || moduleSize == 0) return IntPtr.Zero;
             try
             {
-                var module = targetProcess.MainModule;
-                long moduleSize = module.ModuleMemorySize;
-                var moduleBytes = new byte[moduleSize];
-                ReadProcessMemory(processHandle, baseAddress, moduleBytes, (int)moduleSize, out _);
                 var patternBytes = ParsePattern(pattern);
-                for (long i = 0; i < moduleSize - patternBytes.Count; i++)
+                int patternLength = patternBytes.Count;
+                int chunkSize = 0x1000;
+                byte[] buffer = new byte[chunkSize];
+                for (long offset = 0; offset < moduleSize; offset += chunkSize - patternLength)
                 {
-                    bool found = true;
-                    for (int j = 0; j < patternBytes.Count; j++)
+                    int bytesToRead = (int)Math.Min(chunkSize, moduleSize - offset);
+                    if (!ReadProcessMemory(processHandle, IntPtr.Add(baseAddress, (int)offset), buffer, bytesToRead, out int bytesRead))
                     {
-                        if (patternBytes[j] != 0x3F && moduleBytes[i + j] != patternBytes[j]) { found = false; break; }
+                        continue;
                     }
-                    if (found) return IntPtr.Add(baseAddress, (int)i);
+                    for (int i = 0; i <= bytesRead - patternLength; i++)
+                    {
+                        bool found = true;
+                        for (int j = 0; j < patternLength; j++)
+                        {
+                            byte? b = patternBytes[j];
+                            if (b.HasValue && buffer[i + j] != b.Value)
+                            {
+                                found = false;
+                                break;
+                            }
+                        }
+                        if (found)
+                        {
+                            return IntPtr.Add(baseAddress, (int)(offset + i));
+                        }
+                    }
                 }
             }
-            catch { return IntPtr.Zero; }
+            catch { }
             return IntPtr.Zero;
         }
 
-        private List<byte> ParsePattern(string pattern)
+        private List<byte?> ParsePattern(string pattern)
         {
-            var bytes = new List<byte>();
+            var bytes = new List<byte?>();
             foreach (var b in pattern.Split(' '))
             {
-                bytes.Add(b == "??" ? (byte)0x3F : byte.Parse(b, NumberStyles.HexNumber));
+                bytes.Add(b == "??" ? (byte?)null : byte.Parse(b, NumberStyles.HexNumber));
             }
             return bytes;
         }
