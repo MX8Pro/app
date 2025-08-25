@@ -29,14 +29,17 @@ namespace ShadowCore // تأكد من أن هذا يطابق اسم مشروعك
         // --- Class for Code Patches (On/Off Cheats) ---
         public class PatchCheat : CheatItem
         {
-            public string Pattern { get; }
+            public string[] Patterns { get; }
             public byte[] BytesOn { get; }
             public byte[] BytesOff { get; }
             public int Offset { get; }
 
-            public PatchCheat(string name, string pattern, byte[] bytesOn, byte[] bytesOff, int offset = 0) : base(name)
+            public PatchCheat(string name, string pattern, byte[] bytesOn, byte[] bytesOff, int offset = 0)
+                : this(name, new[] { pattern }, bytesOn, bytesOff, offset) { }
+
+            public PatchCheat(string name, string[] patterns, byte[] bytesOn, byte[] bytesOff, int offset = 0) : base(name)
             {
-                Pattern = pattern;
+                Patterns = patterns;
                 BytesOn = bytesOn;
                 BytesOff = bytesOff;
                 Offset = offset;
@@ -46,15 +49,18 @@ namespace ShadowCore // تأكد من أن هذا يطابق اسم مشروعك
         // --- Class for Pointer-based Values (e.g., Skill Points) ---
         public class PointerCheat : CheatItem
         {
-            public string Pattern { get; }
+            public string[] Patterns { get; }
             public int PointerInstructionOffset { get; }
             public int[] Offsets { get; }
             public IntPtr ResolvedAddress { get; set; }
             public Type DataType { get; } // e.g., typeof(int), typeof(byte)
 
-            public PointerCheat(string name, string pattern, int pointerInstructionOffset, int[] offsets, Type dataType) : base(name)
+            public PointerCheat(string name, string pattern, int pointerInstructionOffset, int[] offsets, Type dataType)
+                : this(name, new[] { pattern }, pointerInstructionOffset, offsets, dataType) { }
+
+            public PointerCheat(string name, string[] patterns, int pointerInstructionOffset, int[] offsets, Type dataType) : base(name)
             {
-                Pattern = pattern;
+                Patterns = patterns;
                 PointerInstructionOffset = pointerInstructionOffset;
                 Offsets = offsets;
                 ResolvedAddress = IntPtr.Zero;
@@ -287,7 +293,7 @@ namespace ShadowCore // تأكد من أن هذا يطابق اسم مشروعك
         {
             try
             {
-                IntPtr basePtrAddr = FindPattern(cheat.Pattern);
+                IntPtr basePtrAddr = FindPattern(cheat.Patterns);
                 if (basePtrAddr == IntPtr.Zero) return IntPtr.Zero;
 
                 byte[] buffer = new byte[4];
@@ -318,7 +324,7 @@ namespace ShadowCore // تأكد من أن هذا يطابق اسم مشروعك
             if (!isAttached) return;
             Task.Run(() =>
             {
-                IntPtr address = FindPattern(cheat.Pattern);
+                IntPtr address = FindPattern(cheat.Patterns);
                 if (address != IntPtr.Zero)
                 {
                     byte[] bytesToWrite = enable ? cheat.BytesOn : cheat.BytesOff;
@@ -344,53 +350,108 @@ namespace ShadowCore // تأكد من أن هذا يطابق اسم مشروعك
 
         private bool WriteMemory(IntPtr address, byte[] bytes) => WriteProcessMemory(processHandle, address, bytes, bytes.Length, out _);
 
-        private IntPtr FindPattern(string pattern)
+        private IntPtr FindPattern(string[] patterns)
         {
-            if (!isAttached || baseAddress == IntPtr.Zero || moduleSize == 0) return IntPtr.Zero;
-            try
+            if (!isAttached || targetProcess == null) return IntPtr.Zero;
+            foreach (var pat in patterns)
             {
-                var patternBytes = ParsePattern(pattern);
-                int patternLength = patternBytes.Count;
-                int chunkSize = 0x1000;
-                byte[] buffer = new byte[chunkSize];
-                for (long offset = 0; offset < moduleSize; offset += chunkSize - patternLength)
+                var (patBytes, mask) = ParsePattern(pat);
+                foreach (ProcessModule module in targetProcess.Modules)
                 {
-                    int bytesToRead = (int)Math.Min(chunkSize, moduleSize - offset);
-                    if (!ReadProcessMemory(processHandle, IntPtr.Add(baseAddress, (int)offset), buffer, bytesToRead, out int bytesRead))
-                    {
-                        continue;
-                    }
-                    for (int i = 0; i <= bytesRead - patternLength; i++)
-                    {
-                        bool found = true;
-                        for (int j = 0; j < patternLength; j++)
-                        {
-                            byte? b = patternBytes[j];
-                            if (b.HasValue && buffer[i + j] != b.Value)
-                            {
-                                found = false;
-                                break;
-                            }
-                        }
-                        if (found)
-                        {
-                            return IntPtr.Add(baseAddress, (int)(offset + i));
-                        }
-                    }
+                    IntPtr found = ScanModule(module.BaseAddress, module.ModuleMemorySize, patBytes, mask);
+                    if (found != IntPtr.Zero) return found;
                 }
             }
-            catch { }
             return IntPtr.Zero;
         }
 
-        private List<byte?> ParsePattern(string pattern)
+        private IntPtr ScanModule(IntPtr moduleBase, long moduleSize, byte[] patternBytes, bool[] mask)
         {
-            var bytes = new List<byte?>();
-            foreach (var b in pattern.Split(' '))
+            int patternLength = patternBytes.Length;
+            IntPtr current = moduleBase;
+            long remaining = moduleSize;
+            while (remaining > 0)
             {
-                bytes.Add(b == "??" ? (byte?)null : byte.Parse(b, NumberStyles.HexNumber));
+                if (VirtualQueryEx(processHandle, current, out MEMORY_BASIC_INFORMATION mbi, (uint)Marshal.SizeOf<MEMORY_BASIC_INFORMATION>()) == IntPtr.Zero)
+                    break;
+                long regionSize = Math.Min(remaining, (long)mbi.RegionSize);
+                if (mbi.State == MEM_COMMIT && IsReadable(mbi.Protect))
+                {
+                    const int chunkSize = 0x1000;
+                    byte[] buffer = new byte[chunkSize];
+                    for (long offset = 0; offset < regionSize; offset += chunkSize - patternLength)
+                    {
+                        int bytesToRead = (int)Math.Min(chunkSize, regionSize - offset);
+                        IntPtr readAddr = IntPtr.Add(current, (int)offset);
+                        if (!ReadProcessMemory(processHandle, readAddr, buffer, bytesToRead, out int bytesRead))
+                            continue;
+                        for (int i = 0; i <= bytesRead - patternLength; i++)
+                        {
+                            bool found = true;
+                            for (int j = 0; j < patternLength; j++)
+                            {
+                                if (!mask[j] && buffer[i + j] != patternBytes[j])
+                                {
+                                    found = false;
+                                    break;
+                                }
+                            }
+                            if (found)
+                                return IntPtr.Add(readAddr, i);
+                        }
+                    }
+                }
+                long advance = regionSize;
+                current = IntPtr.Add(current, (int)advance);
+                remaining -= advance;
             }
-            return bytes;
+            return IntPtr.Zero;
+        }
+
+        private (byte[] bytes, bool[] mask) ParsePattern(string pattern)
+        {
+            var tokens = pattern.Split(' ');
+            var bytes = new byte[tokens.Length];
+            var mask = new bool[tokens.Length];
+            for (int i = 0; i < tokens.Length; i++)
+            {
+                if (tokens[i] == "??")
+                {
+                    mask[i] = true;
+                    bytes[i] = 0;
+                }
+                else
+                {
+                    mask[i] = false;
+                    bytes[i] = byte.Parse(tokens[i], NumberStyles.HexNumber);
+                }
+            }
+            return (bytes, mask);
+        }
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern IntPtr VirtualQueryEx(IntPtr hProcess, IntPtr lpAddress, out MEMORY_BASIC_INFORMATION lpBuffer, uint dwLength);
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct MEMORY_BASIC_INFORMATION
+        {
+            public IntPtr BaseAddress;
+            public IntPtr AllocationBase;
+            public uint AllocationProtect;
+            public IntPtr RegionSize;
+            public uint State;
+            public uint Protect;
+            public uint Type;
+        }
+
+        private const uint MEM_COMMIT = 0x1000;
+        private const uint PAGE_GUARD = 0x100;
+        private const uint PAGE_NOACCESS = 0x01;
+
+        private bool IsReadable(uint protect)
+        {
+            if ((protect & PAGE_GUARD) != 0 || protect == PAGE_NOACCESS) return false;
+            return protect == 0x02 || protect == 0x04 || protect == 0x08 || protect == 0x20 || protect == 0x40 || protect == 0x80;
         }
 
         protected override void OnFormClosing(FormClosingEventArgs e)
