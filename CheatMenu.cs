@@ -316,34 +316,40 @@ namespace ShadowCore // تأكد من أن هذا يطابق اسم مشروعك
 
         private IntPtr FindPattern(string pattern)
         {
-            if (targetProcess == null || !isAttached || targetProcess.HasExited || targetProcess.MainModule == null) return IntPtr.Zero;
+            if (targetProcess == null || !isAttached || targetProcess.HasExited || targetProcess.MainModule == null)
+                return IntPtr.Zero;
             try
             {
                 var module = targetProcess.MainModule;
-                long moduleSize = module.ModuleMemorySize;
+                int moduleSize = module!.ModuleMemorySize;
                 var moduleBytes = new byte[moduleSize];
-                ReadProcessMemory(processHandle, baseAddress, moduleBytes, (int)moduleSize, out _);
+                ReadProcessMemory(processHandle, baseAddress, moduleBytes, moduleSize, out _);
                 var patternBytes = ParsePattern(pattern);
-                for (long i = 0; i < moduleSize - patternBytes.Count; i++)
+                for (int i = 0; i < moduleSize - patternBytes.Count; i++)
                 {
                     bool found = true;
                     for (int j = 0; j < patternBytes.Count; j++)
                     {
-                        if (patternBytes[j] != 0x3F && moduleBytes[i + j] != patternBytes[j]) { found = false; break; }
+                        var b = patternBytes[j];
+                        if (b.HasValue && moduleBytes[i + j] != b.Value)
+                        {
+                            found = false;
+                            break;
+                        }
                     }
-                    if (found) return IntPtr.Add(baseAddress, (int)i);
+                    if (found) return IntPtr.Add(baseAddress, i);
                 }
             }
             catch { return IntPtr.Zero; }
             return IntPtr.Zero;
         }
 
-        private List<byte> ParsePattern(string pattern)
+        private List<byte?> ParsePattern(string pattern)
         {
-            var bytes = new List<byte>();
+            var bytes = new List<byte?>();
             foreach (var b in pattern.Split(' '))
             {
-                bytes.Add(b == "??" ? (byte)0x3F : byte.Parse(b, NumberStyles.HexNumber));
+                bytes.Add(b == "??" ? (byte?)null : byte.Parse(b, NumberStyles.HexNumber));
             }
             return bytes;
         }
