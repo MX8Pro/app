@@ -100,9 +100,14 @@ namespace ShadowCore // تأكد من أن هذا يطابق اسم مشروعك
         private static extern bool WriteProcessMemory(IntPtr hProcess, IntPtr lpBaseAddress, byte[] lpBuffer, int dwSize, out int lpNumberOfBytesWritten);
         [DllImport("kernel32.dll", SetLastError = true)]
         private static extern bool CloseHandle(IntPtr hObject);
+        [DllImport("psapi.dll", SetLastError = true)]
+        private static extern bool EnumProcessModulesEx(IntPtr hProcess, IntPtr[] lphModule, int cb, out int lpcbNeeded, uint dwFilterFlag);
+        [DllImport("psapi.dll", SetLastError = true)]
+        private static extern bool GetModuleInformation(IntPtr hProcess, IntPtr hModule, out MODULEINFO lpmodinfo, int cb);
 
         // --- Constants & State ---
         private const uint PROCESS_PERMISSIONS = 0x0010 | 0x0020 | 0x0008 | 0x0400; // VM_READ | VM_WRITE | VM_OPERATION | QUERY_INFORMATION
+        private const uint LIST_MODULES_ALL = 0x03;
         private IntPtr processHandle;
         private Process? targetProcess;
         private bool isAttached = false;
@@ -352,17 +357,32 @@ namespace ShadowCore // تأكد من أن هذا يطابق اسم مشروعك
 
         private IntPtr FindPattern(string[] patterns)
         {
-            if (!isAttached || targetProcess == null) return IntPtr.Zero;
+            if (!isAttached) return IntPtr.Zero;
             foreach (var pat in patterns)
             {
                 var (patBytes, mask) = ParsePattern(pat);
-                foreach (ProcessModule module in targetProcess.Modules)
+                foreach (var (modBase, modSize) in EnumerateModules())
                 {
-                    IntPtr found = ScanModule(module.BaseAddress, module.ModuleMemorySize, patBytes, mask);
+                    IntPtr found = ScanModule(modBase, modSize, patBytes, mask);
                     if (found != IntPtr.Zero) return found;
                 }
             }
             return IntPtr.Zero;
+        }
+
+        private IEnumerable<(IntPtr baseAddress, int size)> EnumerateModules()
+        {
+            EnumProcessModulesEx(processHandle, Array.Empty<IntPtr>(), 0, out int needed, LIST_MODULES_ALL);
+            int count = needed / IntPtr.Size;
+            IntPtr[] modules = new IntPtr[count];
+            if (!EnumProcessModulesEx(processHandle, modules, needed, out needed, LIST_MODULES_ALL))
+                yield break;
+            int modInfoSize = Marshal.SizeOf<MODULEINFO>();
+            foreach (var module in modules)
+            {
+                if (GetModuleInformation(processHandle, module, out MODULEINFO info, modInfoSize))
+                    yield return (info.lpBaseOfDll, info.SizeOfImage);
+            }
         }
 
         private IntPtr ScanModule(IntPtr moduleBase, long moduleSize, byte[] patternBytes, bool[] mask)
@@ -442,6 +462,14 @@ namespace ShadowCore // تأكد من أن هذا يطابق اسم مشروعك
             public uint State;
             public uint Protect;
             public uint Type;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct MODULEINFO
+        {
+            public IntPtr lpBaseOfDll;
+            public int SizeOfImage;
+            public IntPtr EntryPoint;
         }
 
         private const uint MEM_COMMIT = 0x1000;
