@@ -10,6 +10,7 @@ using System.Diagnostics;
 using System.Drawing;
 using System.Linq;
 using System.Runtime.InteropServices;
+using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Forms;
 using System.Globalization;
@@ -34,6 +35,7 @@ namespace ShadowCore // تأكد من أن هذا يطابق اسم مشروعك
             public byte[] BytesOn { get; }
             public byte[] BytesOff { get; }
             public int Offset { get; }
+            public IntPtr ResolvedAddress { get; set; }
 
             public PatchCheat(string name, string pattern, byte[] bytesOn, byte[] bytesOff, int offset = 0)
                 : this(name, new[] { pattern }, bytesOn, bytesOff, offset) { }
@@ -44,6 +46,7 @@ namespace ShadowCore // تأكد من أن هذا يطابق اسم مشروعك
                 BytesOn = bytesOn;
                 BytesOff = bytesOff;
                 Offset = offset;
+                ResolvedAddress = IntPtr.Zero;
             }
         }
 
@@ -117,8 +120,9 @@ namespace ShadowCore // تأكد من أن هذا يطابق اسم مشروعك
         private bool isAttached = false;
         private IntPtr baseAddress;
         private long moduleSize;
-        private bool timerBusy = false;
-        private int scanChunkSize = 0x4000; // Adjustable chunk size
+        private readonly SemaphoreSlim processSemaphore = new SemaphoreSlim(1, 1);
+        private int scanChunkSize = 0x10000; // Adjustable chunk size
+        public int ScanChunkSize { get => scanChunkSize; set => scanChunkSize = value < 0x1000 ? 0x1000 : value; }
 
         // --- UI Elements ---
         private Label lblStatus = null!;
@@ -201,8 +205,7 @@ namespace ShadowCore // تأكد من أن هذا يطابق اسم مشروعك
 
         private void StatusTimer_Tick(object? sender, EventArgs e)
         {
-            if (timerBusy) return;
-            timerBusy = true;
+            if (!processSemaphore.Wait(0)) return;
             try
             {
                 var processes = Process.GetProcessesByName("GRW");
@@ -260,7 +263,7 @@ namespace ShadowCore // تأكد من أن هذا يطابق اسم مشروعك
             }
             finally
             {
-                timerBusy = false;
+                processSemaphore.Release();
             }
         }
 
@@ -287,7 +290,8 @@ namespace ShadowCore // تأكد من أن هذا يطابق اسم مشروعك
                 }
                 else
                 {
-                    Log($"Failed to read pointer value for '{cheat.Name}' at 0x{cheat.ResolvedAddress.ToInt64():X}");
+                    int err = Marshal.GetLastWin32Error();
+                    Log($"Failed to read pointer value for '{cheat.Name}' at 0x{cheat.ResolvedAddress.ToInt64():X} (err {err})");
                 }
             }
         }
@@ -296,30 +300,39 @@ namespace ShadowCore // تأكد من أن هذا يطابق اسم مشروعك
         {
             if (isAttached && cheat.ResolvedAddress != IntPtr.Zero && long.TryParse(valueStr, out long value))
             {
-                byte[] buffer;
-                if (cheat.DataType == typeof(int))
+                processSemaphore.Wait();
+                try
                 {
-                    if (value < int.MinValue || value > int.MaxValue)
+                    byte[] buffer;
+                    if (cheat.DataType == typeof(int))
                     {
-                        Log($"Value {value} out of range for int");
-                        return;
+                        if (value < int.MinValue || value > int.MaxValue)
+                        {
+                            Log($"Value {value} out of range for int");
+                            return;
+                        }
+                        buffer = BitConverter.GetBytes((int)value);
                     }
-                    buffer = BitConverter.GetBytes((int)value);
-                }
-                else if (cheat.DataType == typeof(byte))
-                {
-                    if (value < byte.MinValue || value > byte.MaxValue)
+                    else if (cheat.DataType == typeof(byte))
                     {
-                        Log($"Value {value} out of range for byte");
-                        return;
+                        if (value < byte.MinValue || value > byte.MaxValue)
+                        {
+                            Log($"Value {value} out of range for byte");
+                            return;
+                        }
+                        buffer = new byte[] { (byte)value };
                     }
-                    buffer = new byte[] { (byte)value };
-                }
-                else return;
+                    else return;
 
-                if (!WriteProcessMemory(processHandle, cheat.ResolvedAddress, buffer, buffer.Length, out _))
+                    if (!WriteProcessMemory(processHandle, cheat.ResolvedAddress, buffer, buffer.Length, out _))
+                    {
+                        int err = Marshal.GetLastWin32Error();
+                        Log($"WriteProcessMemory failed for '{cheat.Name}' at 0x{cheat.ResolvedAddress.ToInt64():X} (err {err})");
+                    }
+                }
+                finally
                 {
-                    Log($"WriteProcessMemory failed for '{cheat.Name}' at 0x{cheat.ResolvedAddress.ToInt64():X}");
+                    processSemaphore.Release();
                 }
             }
         }
@@ -338,7 +351,8 @@ namespace ShadowCore // تأكد من أن هذا يطابق اسم مشروعك
                 byte[] buffer = new byte[4];
                 if (!ReadProcessMemory(processHandle, IntPtr.Add(basePtrAddr, cheat.PointerInstructionOffset + 3), buffer, 4, out _))
                 {
-                    Log($"Pointer '{cheat.Name}': failed to read instruction");
+                    int err = Marshal.GetLastWin32Error();
+                    Log($"Pointer '{cheat.Name}': failed to read instruction (err {err})");
                     return IntPtr.Zero;
                 }
                 int relativeOffset = BitConverter.ToInt32(buffer, 0);
@@ -350,7 +364,8 @@ namespace ShadowCore // تأكد من أن هذا يطابق اسم مشروعك
                 {
                     if (!ReadProcessMemory(processHandle, currentAddr, addrBuffer, 8, out _))
                     {
-                        Log($"Pointer '{cheat.Name}': failed reading level {i} at 0x{currentAddr.ToInt64():X}");
+                        int err = Marshal.GetLastWin32Error();
+                        Log($"Pointer '{cheat.Name}': failed reading level {i} at 0x{currentAddr.ToInt64():X} (err {err})");
                         return IntPtr.Zero;
                     }
                     currentAddr = (IntPtr)BitConverter.ToInt64(addrBuffer, 0);
@@ -378,16 +393,38 @@ namespace ShadowCore // تأكد من أن هذا يطابق اسم مشروعك
             if (!isAttached) return;
             Task.Run(() =>
             {
-                IntPtr address = FindPattern(cheat.Patterns);
-                if (address != IntPtr.Zero)
+                processSemaphore.Wait();
+                try
                 {
-                    byte[] bytesToWrite = enable ? cheat.BytesOn : cheat.BytesOff;
-                    WriteMemory(IntPtr.Add(address, cheat.Offset), bytesToWrite);
+                    IntPtr address = cheat.ResolvedAddress;
+                    if (address == IntPtr.Zero)
+                    {
+                        address = FindPattern(cheat.Patterns);
+                        cheat.ResolvedAddress = address;
+                    }
+                    if (address != IntPtr.Zero)
+                    {
+                        byte[] bytesToWrite = enable ? cheat.BytesOn : cheat.BytesOff;
+                        if (!WriteMemory(IntPtr.Add(address, cheat.Offset), bytesToWrite))
+                        {
+                            int err = Marshal.GetLastWin32Error();
+                            Log($"WriteMemory failed for '{cheat.Name}' at 0x{address.ToInt64():X} (err {err}); rescanning");
+                            cheat.ResolvedAddress = IntPtr.Zero;
+                            address = FindPattern(cheat.Patterns);
+                            cheat.ResolvedAddress = address;
+                            if (address != IntPtr.Zero)
+                                WriteMemory(IntPtr.Add(address, cheat.Offset), bytesToWrite);
+                        }
+                    }
+                    else
+                    {
+                        Log($"Pattern not found for '{cheat.Name}'");
+                        this.Invoke((MethodInvoker)delegate { if (patchCheckBoxes.TryGetValue(cheat.Name, out var chk)) chk.Checked = false; });
+                    }
                 }
-                else
+                finally
                 {
-                    MessageBox.Show($"تعذر العثور على نمط الذاكرة لـ '{cheat.Name}'.", "خطأ", MessageBoxButtons.OK, MessageBoxIcon.Error);
-                    this.Invoke((MethodInvoker)delegate { if (patchCheckBoxes.TryGetValue(cheat.Name, out var chk)) chk.Checked = !enable; });
+                    processSemaphore.Release();
                 }
             });
         }
@@ -423,7 +460,9 @@ namespace ShadowCore // تأكد من أن هذا يطابق اسم مشروعك
                         return found;
                     }
                 }
+                Log($"Pattern '{pat}' not found in any module");
             }
+            Log("All provided patterns failed");
             return IntPtr.Zero;
         }
 
