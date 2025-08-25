@@ -14,6 +14,7 @@ using System.Threading.Tasks;
 using System.Windows.Forms;
 using System.Globalization;
 using System.ComponentModel;
+using System.Text;
 
 namespace ShadowCore // تأكد من أن هذا يطابق اسم مشروعك
 {
@@ -104,16 +105,20 @@ namespace ShadowCore // تأكد من أن هذا يطابق اسم مشروعك
         private static extern bool EnumProcessModulesEx(IntPtr hProcess, IntPtr[] lphModule, int cb, out int lpcbNeeded, uint dwFilterFlag);
         [DllImport("psapi.dll", SetLastError = true)]
         private static extern bool GetModuleInformation(IntPtr hProcess, IntPtr hModule, out MODULEINFO lpmodinfo, int cb);
+        [DllImport("psapi.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern uint GetModuleBaseName(IntPtr hProcess, IntPtr hModule, StringBuilder lpBaseName, int nSize);
 
         // --- Constants & State ---
         private const uint PROCESS_PERMISSIONS = 0x0010 | 0x0020 | 0x0008 | 0x0400; // VM_READ | VM_WRITE | VM_OPERATION | QUERY_INFORMATION
         private const uint LIST_MODULES_ALL = 0x03;
+        private const int MAX_READ_RETRIES = 3;
         private IntPtr processHandle;
         private Process? targetProcess;
         private bool isAttached = false;
         private IntPtr baseAddress;
         private long moduleSize;
         private bool timerBusy = false;
+        private int scanChunkSize = 0x4000; // Adjustable chunk size
 
         // --- UI Elements ---
         private Label lblStatus = null!;
@@ -269,14 +274,20 @@ namespace ShadowCore // تأكد من أن هذا يطابق اسم مشروعك
             {
                 int size = Marshal.SizeOf(cheat.DataType);
                 byte[] buffer = new byte[size];
-                ReadProcessMemory(processHandle, cheat.ResolvedAddress, buffer, buffer.Length, out _);
-                object value = 0;
-                if (cheat.DataType == typeof(int)) value = BitConverter.ToInt32(buffer, 0);
-                else if (cheat.DataType == typeof(byte)) value = buffer[0];
-                
-                if (pointerControls.TryGetValue(cheat.Name, out var controls))
+                if (ReadProcessMemory(processHandle, cheat.ResolvedAddress, buffer, buffer.Length, out _))
                 {
-                    controls.txt.Text = value.ToString();
+                    object value = 0;
+                    if (cheat.DataType == typeof(int)) value = BitConverter.ToInt32(buffer, 0);
+                    else if (cheat.DataType == typeof(byte)) value = buffer[0];
+
+                    if (pointerControls.TryGetValue(cheat.Name, out var controls))
+                    {
+                        controls.txt.Text = value.ToString();
+                    }
+                }
+                else
+                {
+                    Log($"Failed to read pointer value for '{cheat.Name}' at 0x{cheat.ResolvedAddress.ToInt64():X}");
                 }
             }
         }
@@ -286,11 +297,30 @@ namespace ShadowCore // تأكد من أن هذا يطابق اسم مشروعك
             if (isAttached && cheat.ResolvedAddress != IntPtr.Zero && long.TryParse(valueStr, out long value))
             {
                 byte[] buffer;
-                if (cheat.DataType == typeof(int)) buffer = BitConverter.GetBytes((int)value);
-                else if (cheat.DataType == typeof(byte)) buffer = new byte[] { (byte)value };
+                if (cheat.DataType == typeof(int))
+                {
+                    if (value < int.MinValue || value > int.MaxValue)
+                    {
+                        Log($"Value {value} out of range for int");
+                        return;
+                    }
+                    buffer = BitConverter.GetBytes((int)value);
+                }
+                else if (cheat.DataType == typeof(byte))
+                {
+                    if (value < byte.MinValue || value > byte.MaxValue)
+                    {
+                        Log($"Value {value} out of range for byte");
+                        return;
+                    }
+                    buffer = new byte[] { (byte)value };
+                }
                 else return;
-                
-                WriteProcessMemory(processHandle, cheat.ResolvedAddress, buffer, buffer.Length, out _);
+
+                if (!WriteProcessMemory(processHandle, cheat.ResolvedAddress, buffer, buffer.Length, out _))
+                {
+                    Log($"WriteProcessMemory failed for '{cheat.Name}' at 0x{cheat.ResolvedAddress.ToInt64():X}");
+                }
             }
         }
 
@@ -299,29 +329,48 @@ namespace ShadowCore // تأكد من أن هذا يطابق اسم مشروعك
             try
             {
                 IntPtr basePtrAddr = FindPattern(cheat.Patterns);
-                if (basePtrAddr == IntPtr.Zero) return IntPtr.Zero;
+                if (basePtrAddr == IntPtr.Zero)
+                {
+                    Log($"Pointer '{cheat.Name}': base pattern not found");
+                    return IntPtr.Zero;
+                }
 
                 byte[] buffer = new byte[4];
-                ReadProcessMemory(processHandle, IntPtr.Add(basePtrAddr, cheat.PointerInstructionOffset + 3), buffer, 4, out _);
+                if (!ReadProcessMemory(processHandle, IntPtr.Add(basePtrAddr, cheat.PointerInstructionOffset + 3), buffer, 4, out _))
+                {
+                    Log($"Pointer '{cheat.Name}': failed to read instruction");
+                    return IntPtr.Zero;
+                }
                 int relativeOffset = BitConverter.ToInt32(buffer, 0);
                 IntPtr pointerBase = IntPtr.Add(basePtrAddr, cheat.PointerInstructionOffset + 7 + relativeOffset);
-                
+
                 IntPtr currentAddr = pointerBase;
                 byte[] addrBuffer = new byte[8];
                 for (int i = 0; i < cheat.Offsets.Length; i++)
                 {
-                    ReadProcessMemory(processHandle, currentAddr, addrBuffer, 8, out _);
+                    if (!ReadProcessMemory(processHandle, currentAddr, addrBuffer, 8, out _))
+                    {
+                        Log($"Pointer '{cheat.Name}': failed reading level {i} at 0x{currentAddr.ToInt64():X}");
+                        return IntPtr.Zero;
+                    }
                     currentAddr = (IntPtr)BitConverter.ToInt64(addrBuffer, 0);
-                    if (currentAddr == IntPtr.Zero) return IntPtr.Zero;
-                    if (i < cheat.Offsets.Length -1) // Apply all but the last offset to the address
+                    if (currentAddr == IntPtr.Zero)
+                    {
+                        Log($"Pointer '{cheat.Name}': null pointer at level {i}");
+                        return IntPtr.Zero;
+                    }
+                    if (i < cheat.Offsets.Length -1)
                     {
                          currentAddr = IntPtr.Add(currentAddr, cheat.Offsets[i]);
                     }
                 }
-                // Apply the final offset
                 return IntPtr.Add(currentAddr, cheat.Offsets.Last());
             }
-            catch { return IntPtr.Zero; }
+            catch (Exception ex)
+            {
+                Log($"ResolvePointer exception for '{cheat.Name}': {ex.Message}");
+                return IntPtr.Zero;
+            }
         }
 
         private void TogglePatch(PatchCheat cheat, bool enable)
@@ -355,22 +404,30 @@ namespace ShadowCore // تأكد من أن هذا يطابق اسم مشروعك
 
         private bool WriteMemory(IntPtr address, byte[] bytes) => WriteProcessMemory(processHandle, address, bytes, bytes.Length, out _);
 
+        private void Log(string message) => Debug.WriteLine(message);
+
         private IntPtr FindPattern(string[] patterns)
         {
             if (!isAttached) return IntPtr.Zero;
             foreach (var pat in patterns)
             {
                 var (patBytes, mask) = ParsePattern(pat);
-                foreach (var (modBase, modSize) in EnumerateModules())
+                Log($"Scanning for pattern '{pat}'");
+                foreach (var (modBase, modSize, modName) in EnumerateModules())
                 {
-                    IntPtr found = ScanModule(modBase, modSize, patBytes, mask);
-                    if (found != IntPtr.Zero) return found;
+                    IntPtr found = ScanModule(modBase, modSize, patBytes, mask, out int matches);
+                    Log($"Module {modName}: found {matches} match(es)");
+                    if (matches > 0)
+                    {
+                        Log($"Using address 0x{found.ToInt64():X}");
+                        return found;
+                    }
                 }
             }
             return IntPtr.Zero;
         }
 
-        private IEnumerable<(IntPtr baseAddress, int size)> EnumerateModules()
+        private IEnumerable<(IntPtr baseAddress, int size, string name)> EnumerateModules()
         {
             EnumProcessModulesEx(processHandle, Array.Empty<IntPtr>(), 0, out int needed, LIST_MODULES_ALL);
             int count = needed / IntPtr.Size;
@@ -381,12 +438,18 @@ namespace ShadowCore // تأكد من أن هذا يطابق اسم مشروعك
             foreach (var module in modules)
             {
                 if (GetModuleInformation(processHandle, module, out MODULEINFO info, modInfoSize))
-                    yield return (info.lpBaseOfDll, info.SizeOfImage);
+                {
+                    StringBuilder name = new StringBuilder(260);
+                    GetModuleBaseName(processHandle, module, name, name.Capacity);
+                    yield return (info.lpBaseOfDll, info.SizeOfImage, name.ToString());
+                }
             }
         }
 
-        private IntPtr ScanModule(IntPtr moduleBase, long moduleSize, byte[] patternBytes, bool[] mask)
+        private IntPtr ScanModule(IntPtr moduleBase, long moduleSize, byte[] patternBytes, bool[] mask, out int matchCount)
         {
+            matchCount = 0;
+            IntPtr firstMatch = IntPtr.Zero;
             int patternLength = patternBytes.Length;
             IntPtr current = moduleBase;
             long remaining = moduleSize;
@@ -397,14 +460,26 @@ namespace ShadowCore // تأكد من أن هذا يطابق اسم مشروعك
                 long regionSize = Math.Min(remaining, (long)mbi.RegionSize);
                 if (mbi.State == MEM_COMMIT && IsReadable(mbi.Protect))
                 {
-                    const int chunkSize = 0x1000;
-                    byte[] buffer = new byte[chunkSize];
-                    for (long offset = 0; offset < regionSize; offset += chunkSize - patternLength)
+                    byte[] buffer = new byte[scanChunkSize];
+                    for (long offset = 0; offset < regionSize; offset += Math.Max(1, scanChunkSize - patternLength))
                     {
-                        int bytesToRead = (int)Math.Min(chunkSize, regionSize - offset);
+                        int bytesToRead = (int)Math.Min(scanChunkSize, regionSize - offset);
                         IntPtr readAddr = IntPtr.Add(current, (int)offset);
-                        if (!ReadProcessMemory(processHandle, readAddr, buffer, bytesToRead, out int bytesRead))
+                        int bytesRead = 0;
+                        bool success = false;
+                        for (int attempt = 0; attempt < MAX_READ_RETRIES; attempt++)
+                        {
+                            if (ReadProcessMemory(processHandle, readAddr, buffer, bytesToRead, out bytesRead))
+                            {
+                                success = true;
+                                break;
+                            }
+                        }
+                        if (!success)
+                        {
+                            Log($"ReadProcessMemory failed at 0x{readAddr.ToInt64():X}");
                             continue;
+                        }
                         for (int i = 0; i <= bytesRead - patternLength; i++)
                         {
                             bool found = true;
@@ -417,7 +492,11 @@ namespace ShadowCore // تأكد من أن هذا يطابق اسم مشروعك
                                 }
                             }
                             if (found)
-                                return IntPtr.Add(readAddr, i);
+                            {
+                                if (matchCount == 0)
+                                    firstMatch = IntPtr.Add(readAddr, i);
+                                matchCount++;
+                            }
                         }
                     }
                 }
@@ -425,7 +504,7 @@ namespace ShadowCore // تأكد من أن هذا يطابق اسم مشروعك
                 current = IntPtr.Add(current, (int)advance);
                 remaining -= advance;
             }
-            return IntPtr.Zero;
+            return firstMatch;
         }
 
         private (byte[] bytes, bool[] mask) ParsePattern(string pattern)
